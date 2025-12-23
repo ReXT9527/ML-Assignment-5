@@ -1,24 +1,20 @@
-from typing import List, Dict, Optional
-from openai import AsyncOpenAI
+import math
+import re
+from typing import Dict, List, Optional
+
+import numpy as np
 import tiktoken
-import random
+from openai import AsyncOpenAI
 
 from model import ModelProvider
 
 
-class ExampleAgent(ModelProvider):
-    """
-    Example implementation of a multi-document retrieval agent.
+class RetrievalAgent(ModelProvider):
+    """A retrieval-focused agent for multi-document needle tasks.
 
-    This baseline implementation demonstrates the interface but uses a naive strategy:
-    - Randomly selects 1 text file
-    - Randomly extracts 10000 tokens
-    
-    For better performance, consider implementing:
-    - Retrieval from all relevant files
-    - RAG (Retrieval-Augmented Generation) with vector search
-    - Intelligent file selection based on relevance
-    - Query-aware context extraction
+    The agent performs lightweight keyword-based retrieval across all modified files,
+    extracts the most relevant chunks within a token budget, and crafts a concise
+    prompt that encourages grounded answers.
     """
 
     def __init__(self, api_key: str, base_url: str):
@@ -26,108 +22,187 @@ class ExampleAgent(ModelProvider):
         self.model_name = "ecnu-max"
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.tokenizer = tiktoken.encoding_for_model("gpt-4")
-        self.max_tokens_per_request = 10000
+
+        # Retrieval configuration
+        self.chunk_size = 320
+        self.chunk_overlap = 64
+        self.max_context_tokens = 8000
+        self.min_chunks = 6
 
     async def evaluate_model(self, prompt: Dict) -> str:
-        """
-        Handle multi-document retrieval task.
+        context_data = prompt["context_data"]
+        question = prompt["question"]
 
-        Baseline strategy:
-        1. Randomly select 1 file from all available files
-        2. Randomly extract 10000 tokens from that file
-        3. Send to LLM for answering
-        
-        This is a naive approach for demonstration purposes.
+        keywords = self._extract_keywords(question)
+        ranked_chunks = self._rank_chunks(context_data["files"], keywords)
+        selected_chunks = self._select_chunks_within_budget(ranked_chunks)
 
-        Args:
-            prompt: Dictionary containing context_data and question
-
-        Returns:
-            Model response
-        """
-        context_data = prompt['context_data']
-        question = prompt['question']
-
-        # Use baseline random selection strategy
-        selected_content = self._random_select_strategy(context_data)
+        context_blocks = "\n\n".join(
+            [f"File: {c['filename']}\nExcerpt:\n{c['text']}" for c in selected_chunks]
+        )
 
         messages = [
             {
                 "role": "system",
-                "content": "You are a helpful AI assistant. Answer the question based on the provided context."
+                "content": (
+                    "You are a meticulous research assistant. Base answers ONLY on the given excerpts. "
+                    "Quote the key sentences verbatim when possible and avoid explanations, bullet points, "
+                    "or prefixed phrases. Respond with the final answer text only."
+                ),
             },
             {
                 "role": "user",
-                "content": f"Context:\n{selected_content}\n\nQuestion: {question}\n\nAnswer:"
-            }
+                "content": (
+                    f"Context excerpts (most relevant first):\n{context_blocks}\n\n"
+                    f"Question: {question}\n\n"
+                    "Return the direct answer using only the excerpts above. If multiple excerpts are relevant, "
+                    "combine them into one concise statement without adding commentary."
+                ),
+            },
         ]
 
         response = await self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            temperature=0,
-            max_tokens=300
+            temperature=0.2,
+            max_tokens=300,
         )
 
         return response.choices[0].message.content
 
-    def _random_select_strategy(self, context_data: Dict) -> str:
-        """
-        Baseline strategy: Randomly select 1 file and extract 10000 tokens.
+    def _extract_keywords(self, text: str) -> List[str]:
+        tokens = re.findall(r"[\w']+", text.lower())
+        stopwords = {
+            "the",
+            "a",
+            "an",
+            "of",
+            "and",
+            "to",
+            "in",
+            "on",
+            "for",
+            "with",
+            "is",
+            "are",
+            "was",
+            "were",
+            "what",
+            "which",
+            "who",
+            "whom",
+            "when",
+            "where",
+            "why",
+            "how",
+        }
+        return [t for t in tokens if t not in stopwords]
 
-        This is intentionally naive to demonstrate the interface.
-        Implement smarter retrieval strategies for better performance.
+    def _split_into_chunks(self, text: str) -> List[str]:
+        """Split text into overlapping chunks based on token count."""
+        token_ids = self.encode_text_to_tokens(text)
+        if len(token_ids) <= self.chunk_size:
+            return [text]
 
-        Args:
-            context_data: Dictionary containing all file information
+        chunks = []
+        step = self.chunk_size - self.chunk_overlap
+        for start in range(0, len(token_ids), step):
+            end = start + self.chunk_size
+            chunk_tokens = token_ids[start:end]
+            chunks.append(self.decode_tokens(chunk_tokens))
+            if end >= len(token_ids):
+                break
+        return chunks
 
-        Returns:
-            Extracted text content
-        """
-        files = context_data['files']
+    def _sentence_windows(self, text: str, max_sentences: int = 3) -> List[str]:
+        """Create multi-sentence windows to keep context intact."""
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        windows = []
+        for i in range(len(sentences)):
+            for span in range(1, max_sentences + 1):
+                segment = " ".join(sentences[i : i + span]).strip()
+                if segment:
+                    windows.append(segment)
+        return windows or [text]
 
-        # Randomly select one file
-        selected_file = random.choice(files)
-        print(f"[Baseline] Randomly selected file: {selected_file['filename']}")
+    def _chunk_score(self, chunk: str, keywords: List[str]) -> float:
+        if not keywords:
+            return 0.0
 
-        content = selected_file['modified_content']
-        tokens = self.encode_text_to_tokens(content)
+        words = re.findall(r"[\w']+", chunk.lower())
+        if not words:
+            return 0.0
 
-        # If file is smaller than max tokens, return entire content
-        if len(tokens) <= self.max_tokens_per_request:
-            return content
+        word_counts = {}
+        for w in words:
+            word_counts[w] = word_counts.get(w, 0) + 1
 
-        # Randomly extract a chunk
-        max_start = len(tokens) - self.max_tokens_per_request
-        start_pos = random.randint(0, max_start)
-        end_pos = start_pos + self.max_tokens_per_request
+        matched = [k for k in keywords if word_counts.get(k, 0) > 0]
+        coverage = len(set(matched)) / max(1, len(set(keywords)))
+        density = sum(word_counts.get(k, 0) for k in keywords) / max(1, len(words))
+        return float(2.5 * coverage + density)
 
-        print(f"[Baseline] Randomly extracted tokens {start_pos}-{end_pos} from {len(tokens)} total")
+    def _rank_chunks(self, files: List[Dict], keywords: List[str]) -> List[Dict]:
+        """Rank contextual windows from each file by keyword overlap."""
+        ranked = []
+        for file_data in files:
+            windows = self._sentence_windows(file_data["modified_content"])
+            if keywords:
+                windows = [w for w in windows if any(k in w.lower() for k in keywords)] or windows
 
-        selected_tokens = tokens[start_pos:end_pos]
-        return self.decode_tokens(selected_tokens)
+            for window in windows:
+                score = self._chunk_score(window, keywords)
+                ranked.append(
+                    {
+                        "filename": file_data["filename"],
+                        "text": window,
+                        "score": score,
+                        "token_count": len(self.encode_text_to_tokens(window)),
+                    }
+                )
+
+        ranked.sort(key=lambda c: (c["score"], -c["token_count"]), reverse=True)
+        return ranked
+
+    def _select_chunks_within_budget(self, ranked_chunks: List[Dict]) -> List[Dict]:
+        """Keep high-value chunks while covering multiple files."""
+        selected = []
+        budget = self.max_context_tokens
+
+        # Prefer the best chunk from each file first
+        best_by_file = {}
+        for chunk in ranked_chunks:
+            if chunk["filename"] not in best_by_file:
+                best_by_file[chunk["filename"]] = chunk
+
+        prioritized = list(best_by_file.values()) + ranked_chunks
+        seen = set()
+
+        for chunk in prioritized:
+            key = (chunk["filename"], chunk["text"])
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if chunk["token_count"] <= budget or not selected:
+                selected.append(chunk)
+                budget -= chunk["token_count"]
+
+            if len(selected) >= self.min_chunks and budget <= 0:
+                break
+
+        return selected
 
     def generate_prompt(self, **kwargs) -> Dict:
-        """
-        Generate prompt structure for the model.
-
-        Args:
-            **kwargs: Flexible parameters (context_data, question, etc.)
-
-        Returns:
-            Dictionary containing all prompt information
-        """
         return {
-            'context_data': kwargs.get('context_data'),
-            'question': kwargs.get('question')
+            "context_data": kwargs.get("context_data"),
+            "question": kwargs.get("question"),
         }
 
     def encode_text_to_tokens(self, text: str) -> List[int]:
-        """Encode text to token IDs."""
         return self.tokenizer.encode(text)
 
     def decode_tokens(self, tokens: List[int], context_length: Optional[int] = None) -> str:
-        """Decode token IDs to text."""
         if context_length:
             tokens = tokens[:context_length]
         return self.tokenizer.decode(tokens)
