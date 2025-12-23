@@ -8,6 +8,28 @@ from openai import AsyncOpenAI
 
 from model import ModelProvider
 
+# -----------------------------
+# Helpers
+# -----------------------------
+
+_WORD_RE = re.compile(r"[0-9A-Za-z\u0370-\u03FF\u1F00-\u1FFF]+")
+# "Anchor" = likely-unique identifier token patterns (IDs, codes, refs)
+_ANCHOR_RE = re.compile(
+    r"""
+    (?:
+        # Things like ABC-123, P-8813-Zeta, ID_42X, ref:XYZ-9A, Ω-42, ΦΔ_9A
+        [0-9A-Za-z\u0370-\u03FF\u1F00-\u1FFF]{2,}[\-_][0-9A-Za-z\u0370-\u03FF\u1F00-\u1FFF]{2,} |
+        [0-9A-Za-z\u0370-\u03FF\u1F00-\u1FFF]{2,}[\-_][0-9A-Za-z\u0370-\u03FF\u1F00-\u1FFF]{2,} |
+        [A-Za-z\u0370-\u03FF\u1F00-\u1FFF]{2,}\d{2,}[0-9A-Za-z\u0370-\u03FF\u1F00-\u1FFF]* |
+        \d{2,}[A-Za-z\u0370-\u03FF\u1F00-\u1FFF]{2,}[0-9A-Za-z\u0370-\u03FF\u1F00-\u1FFF]* |
+        [0-9A-Za-z\u0370-\u03FF\u1F00-\u1FFF]{6,}  # long-ish alnum token
+    )
+    """,
+    re.VERBOSE,
+)
+
+def _word_tokenize(text: str) -> List[str]:
+    return _WORD_RE.findall(text.lower())
 
 class RetrievalAgent(ModelProvider):
     """A retrieval-focused agent for multi-document needle tasks.
@@ -19,8 +41,15 @@ class RetrievalAgent(ModelProvider):
 
     def __init__(self, api_key: str, base_url: str):
         super().__init__(api_key, base_url)
+
         self.model_name = "ecnu-max"
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        
+        # --- FIX START: 保存参数，而不是直接创建 client ---
+        # 避免在 __init__ 中创建长连接，改为在 evaluate_model 中按需创建
+        self.client_args = {"api_key": api_key, "base_url": base_url}
+        # --- FIX END ---
+
+        # Tokenizer only for chunking + budget control
         self.tokenizer = tiktoken.encoding_for_model("gpt-4")
 
         # Retrieval configuration
@@ -41,6 +70,16 @@ class RetrievalAgent(ModelProvider):
             [f"File: {c['filename']}\nExcerpt:\n{c['text']}" for c in selected_chunks]
         )
 
+        # 5) Char-n-gram rerank (cheap & strong for IDs/codes/encoded strings)
+        reranked = self._char_ngram_rerank(candidates, question, top_k=self.final_top_k)
+
+        # 6) Optional dense rerank (only if available; otherwise skipped)
+        reranked = self._dense_rerank_if_available(reranked, question)
+
+        # 7) Pack snippets
+        packed_context = self._pack_chunks(reranked, token_budget=self.max_context_tokens)
+
+        # 8) Ask LLM to output only ONE clean answer line
         messages = [
             {
                 "role": "system",
@@ -68,7 +107,11 @@ class RetrievalAgent(ModelProvider):
             max_tokens=300,
         )
 
-        return response.choices[0].message.content
+        for f in files:
+            filename = str(f.get("filename", "unknown"))
+            content = f.get("modified_content") or ""
+            if not content.strip():
+                continue
 
     def _extract_keywords(self, text: str) -> List[str]:
         tokens = re.findall(r"[\w']+", text.lower())
